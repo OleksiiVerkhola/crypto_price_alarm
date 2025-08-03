@@ -2,105 +2,83 @@
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-// ==== ЗАГРУЗКА КЛЮЧЕЙ ====
-$keys = require __DIR__ . '/config_bot.php';
-$botToken = $keys['botToken'];
-$chatId   = $keys['chatId'];
-
-// ==== НАСТРОЙКИ ====
 $configFile = __DIR__ . "/config.json";
-$apiUrl = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=BTC-USDT";
-$checkInterval = 60; // проверка каждые 60 секунд
+$offsetFile = __DIR__ . "/last_update_id.txt";
+$tokenFile = __DIR__ . "/token_chatid.php"; // где хранятся $botToken и $chatId
 
-// ==== СОЗДАЁМ КОНФИГ, ЕСЛИ ЕГО НЕТ ====
-if (!file_exists($configFile)) {
-    file_put_contents($configFile, json_encode(["low" => 0, "high" => 0], JSON_PRETTY_PRINT));
+// Подключаем токен и чат ID
+if (!file_exists($tokenFile)) {
+    die("Файл с токеном и chatId не найден.");
 }
+include $tokenFile;
 
-// ==== ФУНКЦИЯ ОТПРАВКИ В TELEGRAM ====
-function sendTelegram($message) {
-    global $botToken, $chatId;
+// Функция отправки уведомлений в Telegram
+function sendTelegram($botToken, $chatId, $message) {
     $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
     $data = ['chat_id' => $chatId, 'text' => $message];
-
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_exec($ch);
-    curl_close($ch);
-}
-
-// ==== ФУНКЦИЯ ПОЛУЧЕНИЯ ПОСЛЕДНЕЙ КОМАНДЫ ====
-function getLastCommand() {
-    global $botToken;
-    $url = "https://api.telegram.org/bot{$botToken}/getUpdates";
-
-    $res = file_get_contents($url);
-    if (!$res) return null;
-
-    $data = json_decode($res, true);
-    if (!isset($data['result'])) return null;
-
-    $updates = $data['result'];
-    if (empty($updates)) return null;
-
-    $lastUpdate = end($updates);
-    return [
-        'text' => trim($lastUpdate['message']['text'] ?? ''),
-        'id'   => $lastUpdate['message']['chat']['id'] ?? ''
+    $options = [
+        'http' => [
+            'method'  => 'POST',
+            'header'  => "Content-Type: application/x-www-form-urlencoded\r\n",
+            'content' => http_build_query($data),
+        ],
     ];
+    $context  = stream_context_create($options);
+    file_get_contents($url, false, $context);
 }
 
-// ==== ОСНОВНОЙ ЦИКЛ ====
-sendTelegram("🤖 BTC Bot запущен!");
-$lastPrice = null;
+// Загружаем конфиг
+if (!file_exists($configFile)) {
+    file_put_contents($configFile, json_encode(['low' => 0, 'high' => 0, 'chatId' => 0], JSON_PRETTY_PRINT));
+}
+$config = json_decode(file_get_contents($configFile), true);
 
-while (true) {
-    // Загружаем текущие пороги
-    $config = json_decode(file_get_contents($configFile), true);
+// Читаем последний offset
+$lastUpdateId = 0;
+if (file_exists($offsetFile)) {
+    $lastUpdateId = (int)file_get_contents($offsetFile);
+}
 
-    // Проверка команд
-    $cmd = getLastCommand();
-    if ($cmd && $cmd['id'] == $chatId) {
-        if (preg_match("/^\/low\s+(\d+(\.\d+)?)/", $cmd['text'], $m)) {
-            $config['low'] = floatval($m[1]);
-            file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
-            sendTelegram("✅ Нижний порог установлен: {$config['low']}$");
-        } elseif (preg_match("/^\/high\s+(\d+(\.\d+)?)/", $cmd['text'], $m)) {
-            $config['high'] = floatval($m[1]);
-            file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
-            sendTelegram("✅ Верхний порог установлен: {$config['high']}$");
-        }
-    }
+// Получаем новые обновления
+$url = "https://api.telegram.org/bot{$botToken}/getUpdates?offset=" . ($lastUpdateId + 1);
+$response = file_get_contents($url);
+$data = json_decode($response, true);
 
-    // Получение текущей цены
-    $response = @file_get_contents($apiUrl);
-    if ($response) {
-        $data = json_decode($response, true);
-        $price = isset($data['data']['price']) ? floatval($data['data']['price']) : null;
+if (!empty($data['result'])) {
+    foreach ($data['result'] as $update) {
+        $lastUpdateId = $update['update_id'];
 
-        if ($price) {
-            echo date("H:i:s") . " BTC: $price USD\n";
+        if (isset($update['message']['text'])) {
+            $message = $update['message']['text'];
+            $chatIdMsg = $update['message']['chat']['id'];
 
-            // Уведомления
-            if ($config['low'] > 0 && $price < $config['low']) {
-                if ($lastPrice === null || $lastPrice >= $config['low']) {
-                    sendTelegram("⚠ BTC упал ниже {$config['low']}$: сейчас $price$");
+            // Проверяем, что сообщение от нужного чата (можно убрать, если надо принимать от всех)
+            if ($chatIdMsg == $config['chatId'] || $config['chatId'] == 0) {
+
+                // Команда /low
+                if (preg_match('/^\/low\s+(\d+(\.\d+)?)/i', $message, $matches)) {
+                    $config['low'] = floatval($matches[1]);
+                    file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
+                    sendTelegram($botToken, $chatIdMsg, "✅ Нижний порог установлен: {$config['low']}$");
+                    // Сохраняем chatId если ещё не установлен
+                    if ($config['chatId'] == 0) {
+                        $config['chatId'] = $chatIdMsg;
+                        file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
+                    }
+                }
+                // Команда /high
+                elseif (preg_match('/^\/high\s+(\d+(\.\d+)?)/i', $message, $matches)) {
+                    $config['high'] = floatval($matches[1]);
+                    file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
+                    sendTelegram($botToken, $chatIdMsg, "✅ Верхний порог установлен: {$config['high']}$");
+                    if ($config['chatId'] == 0) {
+                        $config['chatId'] = $chatIdMsg;
+                        file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT));
+                    }
                 }
             }
-            if ($config['high'] > 0 && $price > $config['high']) {
-                if ($lastPrice === null || $lastPrice <= $config['high']) {
-                    sendTelegram("🚀 BTC вырос выше {$config['high']}$: сейчас $price$");
-                }
-            }
-            $lastPrice = $price;
         }
-    } else {
-        echo "Ошибка получения цены\n";
     }
-
-    sleep($checkInterval);
+    // Сохраняем последний обработанный update_id
+    file_put_contents($offsetFile, $lastUpdateId);
 }
