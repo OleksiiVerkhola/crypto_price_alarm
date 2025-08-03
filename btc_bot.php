@@ -4,7 +4,7 @@ ini_set('display_errors', 1);
 
 $configFile = __DIR__ . "/config.json";
 $offsetFile = __DIR__ . "/last_update_id.txt";
-$tokenFile = __DIR__ . "/token_chatid.php"; // где хранятся $botToken и $chatId
+$tokenFile = __DIR__ . "/config_bot.php"; // где хранятся $botToken и $chatId
 
 // Подключаем токен и чат ID
 if (!file_exists($tokenFile)) {
